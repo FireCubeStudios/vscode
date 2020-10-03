@@ -5,7 +5,7 @@
 
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { createRandomFile, deleteFile, closeAllEditors, pathEquals, rndName, disposeAll, testFs, delay, withLogDisabled } from '../utils';
+import { createRandomFile, deleteFile, closeAllEditors, pathEquals, rndName, disposeAll, testFs, delay, withLogDisabled, revertAllDirty } from '../utils';
 import { join, posix, basename } from 'path';
 import * as fs from 'fs';
 import { TestFS } from '../memfs';
@@ -61,11 +61,18 @@ suite('vscode API - workspace', () => {
 	});
 
 	test('openTextDocument', async () => {
-		const len = vscode.workspace.textDocuments.length;
 		const uri = await createRandomFile();
+
+		// not yet there
+		const existing1 = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString());
+		assert.equal(existing1, undefined);
+
+		// open and assert its there
 		const doc = await vscode.workspace.openTextDocument(uri);
 		assert.ok(doc);
-		assert.equal(vscode.workspace.textDocuments.length, len + 1);
+		assert.equal(doc.uri.toString(), uri.toString());
+		const existing2 = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString());
+		assert.equal(existing2 === doc, true);
 	});
 
 	test('openTextDocument, illegal path', () => {
@@ -281,7 +288,7 @@ suite('vscode API - workspace', () => {
 		const file = await createRandomFile();
 		let disposables: vscode.Disposable[] = [];
 
-		await vscode.workspace.saveAll();
+		await revertAllDirty(); // needed for a clean state for `onDidSaveTextDocument` (#102365)
 
 		let pendingAsserts: Function[] = [];
 		let onDidOpenTextDocument = false;
@@ -322,6 +329,8 @@ suite('vscode API - workspace', () => {
 		const file = await createRandomFile();
 		let disposables: vscode.Disposable[] = [];
 		let pendingAsserts: Function[] = [];
+
+		await revertAllDirty(); // needed for a clean state for `onDidSaveTextDocument` (#102365)
 
 		let onDidSaveTextDocument = false;
 		disposables.push(vscode.workspace.onDidSaveTextDocument(e => {
@@ -527,7 +536,7 @@ suite('vscode API - workspace', () => {
 		assert.equal(callCount, 1);
 		assert.equal(doc.getText(), 'call0');
 
-		return new Promise(resolve => {
+		return new Promise<void>(resolve => {
 
 			let subscription = vscode.workspace.onDidChangeTextDocument(event => {
 				assert.ok(event.document === doc);
@@ -542,7 +551,7 @@ suite('vscode API - workspace', () => {
 	});
 
 	test('findFiles', () => {
-		return vscode.workspace.findFiles('**/*.png').then((res) => {
+		return vscode.workspace.findFiles('**/image.png').then((res) => {
 			assert.equal(res.length, 2);
 			assert.equal(basename(vscode.workspace.asRelativePath(res[0])), 'image.png');
 		});
@@ -563,14 +572,14 @@ suite('vscode API - workspace', () => {
 	});
 
 	test('findFiles - exclude', () => {
-		return vscode.workspace.findFiles('**/*.png').then((res) => {
+		return vscode.workspace.findFiles('**/image.png').then((res) => {
 			assert.equal(res.length, 2);
 			assert.equal(basename(vscode.workspace.asRelativePath(res[0])), 'image.png');
 		});
 	});
 
 	test('findFiles, exclude', () => {
-		return vscode.workspace.findFiles('**/*.png', '**/sub/**').then((res) => {
+		return vscode.workspace.findFiles('**/image.png', '**/sub/**').then((res) => {
 			assert.equal(res.length, 1);
 			assert.equal(basename(vscode.workspace.asRelativePath(res[0])), 'image.png');
 		});
@@ -917,7 +926,10 @@ suite('vscode API - workspace', () => {
 			assert.ok(await vscode.workspace.applyEdit(we));
 
 			const document = await vscode.workspace.openTextDocument(newUri);
-			assert.equal(document.isDirty, true);
+			// See https://github.com/microsoft/vscode/issues/107739
+			// RenameOperation currently saves the file before applying the rename
+			// so that is why the document is not dirty here
+			assert.equal(document.isDirty, false);
 
 			await document.save();
 			assert.equal(document.isDirty, false);

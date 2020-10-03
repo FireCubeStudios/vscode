@@ -15,14 +15,13 @@ import { IInitData, UIKind } from 'vs/workbench/api/common/extHost.protocol';
 import { MessageType, createMessageOfType, isMessageOfType } from 'vs/workbench/services/extensions/common/extensionHostProtocol';
 import { IExtensionHost, ExtensionHostLogFileName, ExtensionHostKind } from 'vs/workbench/services/extensions/common/extensions';
 import { parseExtensionDevOptions } from 'vs/workbench/services/extensions/common/extensionDevOptions';
-import { IRemoteAgentEnvironment } from 'vs/platform/remote/common/remoteAgentEnvironment';
 import { IRemoteAuthorityResolverService, IRemoteConnectionData } from 'vs/platform/remote/common/remoteAuthorityResolver';
 import * as platform from 'vs/base/common/platform';
 import { Schemas } from 'vs/base/common/network';
 import { Disposable } from 'vs/base/common/lifecycle';
 import { ILifecycleService } from 'vs/platform/lifecycle/common/lifecycle';
 import { PersistentProtocol } from 'vs/base/parts/ipc/common/ipc.net';
-import { IExtensionDescription } from 'vs/platform/extensions/common/extensions';
+import { ExtensionIdentifier, IExtensionDescription } from 'vs/platform/extensions/common/extensions';
 import { VSBuffer } from 'vs/base/common/buffer';
 import { IExtensionHostDebugService } from 'vs/platform/debug/common/extensionHostDebug';
 import { IProductService } from 'vs/platform/product/common/productService';
@@ -33,14 +32,20 @@ import { Registry } from 'vs/platform/registry/common/platform';
 import { IOutputChannelRegistry, Extensions } from 'vs/workbench/services/output/common/output';
 import { localize } from 'vs/nls';
 
-export interface IRemoteInitData {
+export interface IRemoteExtensionHostInitData {
 	readonly connectionData: IRemoteConnectionData | null;
-	readonly remoteEnvironment: IRemoteAgentEnvironment;
+	readonly pid: number;
+	readonly appRoot: URI;
+	readonly extensionHostLogsPath: URI;
+	readonly globalStorageHome: URI;
+	readonly workspaceStorageHome: URI;
+	readonly extensions: IExtensionDescription[];
+	readonly allExtensions: IExtensionDescription[];
 }
 
-export interface IInitDataProvider {
+export interface IRemoteExtensionHostDataProvider {
 	readonly remoteAuthority: string;
-	getInitData(): Promise<IRemoteInitData>;
+	getInitData(): Promise<IRemoteExtensionHostInitData>;
 }
 
 export class RemoteExtensionHost extends Disposable implements IExtensionHost {
@@ -56,8 +61,7 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 	private readonly _isExtensionDevHost: boolean;
 
 	constructor(
-		private readonly _allExtensions: Promise<IExtensionDescription[]>,
-		private readonly _initDataProvider: IInitDataProvider,
+		private readonly _initDataProvider: IRemoteExtensionHostDataProvider,
 		private readonly _socketFactory: ISocketFactory,
 		@IWorkspaceContextService private readonly _contextService: IWorkspaceContextService,
 		@IWorkbenchEnvironmentService private readonly _environmentService: IWorkbenchEnvironmentService,
@@ -92,7 +96,8 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 				}
 			},
 			signService: this._signService,
-			logService: this._logService
+			logService: this._logService,
+			ipcLogger: null
 		};
 		return this.remoteAuthorityResolverService.resolveAuthority(this._initDataProvider.remoteAuthority).then((resolverResult) => {
 
@@ -196,53 +201,57 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 		this._onExit.fire([0, null]);
 	}
 
-	private _createExtHostInitData(isExtensionDevelopmentDebug: boolean): Promise<IInitData> {
-		return Promise.all([this._allExtensions, this._telemetryService.getTelemetryInfo(), this._initDataProvider.getInitData()]).then(([allExtensions, telemetryInfo, remoteInitData]) => {
-			// Collect all identifiers for extension ids which can be considered "resolved"
-			const resolvedExtensions = allExtensions.filter(extension => !extension.main).map(extension => extension.identifier);
-			const hostExtensions = allExtensions.filter(extension => extension.main && extension.api === 'none').map(extension => extension.identifier);
-			const workspace = this._contextService.getWorkspace();
-			const remoteEnv = remoteInitData.remoteEnvironment;
-			const r: IInitData = {
-				commit: this._productService.commit,
-				version: this._productService.version,
-				parentPid: remoteEnv.pid,
-				environment: {
-					isExtensionDevelopmentDebug,
-					appRoot: remoteEnv.appRoot,
-					appSettingsHome: remoteEnv.appSettingsHome,
-					appName: this._productService.nameLong,
-					appUriScheme: this._productService.urlProtocol,
-					appLanguage: platform.language,
-					extensionDevelopmentLocationURI: this._environmentService.extensionDevelopmentLocationURI,
-					extensionTestsLocationURI: this._environmentService.extensionTestsLocationURI,
-					globalStorageHome: remoteEnv.globalStorageHome,
-					userHome: remoteEnv.userHome,
-					webviewResourceRoot: this._environmentService.webviewResourceRoot,
-					webviewCspSource: this._environmentService.webviewCspSource,
-				},
-				workspace: this._contextService.getWorkbenchState() === WorkbenchState.EMPTY ? null : {
-					configuration: workspace.configuration,
-					id: workspace.id,
-					name: this._labelService.getWorkspaceLabel(workspace)
-				},
-				remote: {
-					isRemote: true,
-					authority: this._initDataProvider.remoteAuthority,
-					connectionData: remoteInitData.connectionData
-				},
-				resolvedExtensions: resolvedExtensions,
-				hostExtensions: hostExtensions,
-				extensions: remoteEnv.extensions,
-				telemetryInfo,
-				logLevel: this._logService.getLevel(),
-				logsLocation: remoteEnv.extensionHostLogsPath,
-				logFile: joinPath(remoteEnv.extensionHostLogsPath, `${ExtensionHostLogFileName}.log`),
-				autoStart: true,
-				uiKind: platform.isWeb ? UIKind.Web : UIKind.Desktop
-			};
-			return r;
-		});
+	private async _createExtHostInitData(isExtensionDevelopmentDebug: boolean): Promise<IInitData> {
+		const [telemetryInfo, remoteInitData] = await Promise.all([this._telemetryService.getTelemetryInfo(), this._initDataProvider.getInitData()]);
+
+		// Collect all identifiers for extension ids which can be considered "resolved"
+		const remoteExtensions = new Set<string>();
+		remoteInitData.extensions.forEach((extension) => remoteExtensions.add(ExtensionIdentifier.toKey(extension.identifier.value)));
+
+		const resolvedExtensions = remoteInitData.allExtensions.filter(extension => !extension.main && !extension.browser).map(extension => extension.identifier);
+		const hostExtensions = (
+			remoteInitData.allExtensions
+				.filter(extension => !remoteExtensions.has(ExtensionIdentifier.toKey(extension.identifier.value)))
+				.filter(extension => (extension.main || extension.browser) && extension.api === 'none').map(extension => extension.identifier)
+		);
+		const workspace = this._contextService.getWorkspace();
+		return {
+			commit: this._productService.commit,
+			version: this._productService.version,
+			parentPid: remoteInitData.pid,
+			environment: {
+				isExtensionDevelopmentDebug,
+				appRoot: remoteInitData.appRoot,
+				appName: this._productService.nameLong,
+				appUriScheme: this._productService.urlProtocol,
+				appLanguage: platform.language,
+				extensionDevelopmentLocationURI: this._environmentService.extensionDevelopmentLocationURI,
+				extensionTestsLocationURI: this._environmentService.extensionTestsLocationURI,
+				globalStorageHome: remoteInitData.globalStorageHome,
+				workspaceStorageHome: remoteInitData.workspaceStorageHome,
+				webviewResourceRoot: this._environmentService.webviewResourceRoot,
+				webviewCspSource: this._environmentService.webviewCspSource,
+			},
+			workspace: this._contextService.getWorkbenchState() === WorkbenchState.EMPTY ? null : {
+				configuration: workspace.configuration,
+				id: workspace.id,
+				name: this._labelService.getWorkspaceLabel(workspace)
+			},
+			remote: {
+				isRemote: true,
+				authority: this._initDataProvider.remoteAuthority,
+				connectionData: remoteInitData.connectionData
+			},
+			resolvedExtensions: resolvedExtensions,
+			hostExtensions: hostExtensions,
+			extensions: remoteInitData.extensions,
+			telemetryInfo,
+			logLevel: this._logService.getLevel(),
+			logsLocation: remoteInitData.extensionHostLogsPath,
+			logFile: joinPath(remoteInitData.extensionHostLogsPath, `${ExtensionHostLogFileName}.log`),
+			autoStart: true,
+			uiKind: platform.isWeb ? UIKind.Web : UIKind.Desktop
+		};
 	}
 
 	getInspectPort(): number | undefined {
